@@ -15,7 +15,7 @@ class HikvisionUserService
     private int $authRetries = 3;
     private int $delayBetweenBatches = 100; // milisegundos
 
-    // Mapeo de departamentos (equivalente a DEPARTAMENTOS en Next.js)
+    // Mapeo de departamentos
     private const DEPARTMENTS = [
         1 => "TI",
         2 => "Teams Leaders",
@@ -36,7 +36,7 @@ class HikvisionUserService
     }
 
     /**
-     * Extrae usuarios de un dispositivo Hikvision con manejo de lotes
+     * Extrae usuarios de un dispositivo Hikvision
      */
     public function extractDeviceUsers(string $ip, string $deviceName): array
     {
@@ -58,9 +58,13 @@ class HikvisionUserService
                     break;
                 }
 
+                // Solo agregar metadata, NO modificar datos
                 foreach ($users as &$user) {
-                    $user['device_ip'] = $ip;
-                    $user['device_name'] = $deviceName;
+                    $user['_metadata'] = [
+                        'device_ip' => $ip,
+                        'device_name' => $deviceName,
+                        'extracted_at' => now()->toDateTimeString()
+                    ];
                 }
                 unset($user);
 
@@ -68,15 +72,13 @@ class HikvisionUserService
                 $position += count($users);
                 $errors = 0;
 
-                Log::info("Lote {$batchCount}: {count($users)} usuarios (Total: " . count($allUsers) . ")");
+                Log::info("Lote {$batchCount}: " . count($users) . " usuarios (Total: " . count($allUsers) . ")");
 
-                // Si el lote está incompleto, probablemente no hay más datos
                 if (count($users) < $this->batchSize) {
                     Log::info("Lote incompleto - Fin de datos");
                     break;
                 }
 
-                // Pausa entre lotes
                 usleep($this->delayBetweenBatches * 1000);
 
             } catch (Exception $e) {
@@ -91,10 +93,7 @@ class HikvisionUserService
             }
         }
 
-        Log::info("Extracción completada para {$deviceName}", [
-            'total_lotes' => $batchCount,
-            'total_usuarios' => count($allUsers)
-        ]);
+        Log::info("Extracción completada para {$deviceName}: " . count($allUsers) . " usuarios");
 
         return $allUsers;
     }
@@ -112,9 +111,6 @@ class HikvisionUserService
             ]
         ];
 
-        Log::info("Solicitando lote {$batchNum} | Posición: {$position}");
-
-        // Intentar hasta authRetries veces
         for ($attempt = 0; $attempt < $this->authRetries; $attempt++) {
             try {
                 $response = Http::withOptions([
@@ -133,19 +129,14 @@ class HikvisionUserService
                     return $this->parseUsersResponse($data);
                 }
 
-                if ($response->status() === 401) {
-                    Log::warning("Error 401 - Reautenticando (intento " . ($attempt + 1) . ")");
+                if ($response->status() === 401 && $attempt < $this->authRetries - 1) {
+                    Log::warning("Error 401 - Reintentando...");
                     sleep(1);
                     continue;
                 }
 
-                if ($attempt < $this->authRetries - 1) {
-                    Log::warning("Error {$response->status()} - Reintentando...");
-                    sleep(2);
-                }
-
             } catch (Exception $e) {
-                Log::error("Excepción en intento " . ($attempt + 1) . ": " . $e->getMessage());
+                Log::error("Excepción: " . $e->getMessage());
                 if ($attempt < $this->authRetries - 1) {
                     sleep(3);
                 }
@@ -156,7 +147,7 @@ class HikvisionUserService
     }
 
     /**
-     * Parsea la respuesta de usuarios de Hikvision
+     * Parsea la respuesta de usuarios
      */
     private function parseUsersResponse(array $data): array
     {
@@ -166,12 +157,12 @@ class HikvisionUserService
 
         $userInfo = $data['UserInfoSearch']['UserInfo'];
 
-        // Si es un solo usuario, convertirlo en array
+        // Si es un solo usuario
         if (isset($userInfo['employeeNo'])) {
             return [$userInfo];
         }
 
-        // Si es un array de usuarios
+        // Si es un array
         if (is_array($userInfo)) {
             return $userInfo;
         }
@@ -180,51 +171,17 @@ class HikvisionUserService
     }
 
     /**
-     * Procesa usuarios de múltiples dispositivos
+     * Normaliza los datos de un usuario
+     * Devuelve SOLO los datos relevantes, sin metadatos del dispositivo
      */
-    public function processAllDevices(array $devices): array
-    {
-        $allUsers = [];
-
-        foreach ($devices as $device) {
-            try {
-                $users = $this->extractDeviceUsers($device['ip'], $device['name']);
-                $allUsers = array_merge($allUsers, $users);
-
-                Log::info("{$device['name']} completado: " . count($users) . " usuarios");
-
-            } catch (Exception $e) {
-                Log::error("Error en {$device['name']}: " . $e->getMessage());
-                continue;
-            }
-        }
-
-        Log::info("Total usuarios de todos los dispositivos: " . count($allUsers));
-
-        return $allUsers;
-    }
-
-    /**
-     * Normaliza datos de usuario (equivalente a processUserData en Next.js)
-     */
-    public function normalizeUser(array $user, int $index, int $total): ?array
+    public function normalizeUser(array $user): ?array
     {
         try {
-            if (!isset($user['employeeNo'])) {
+            if (!isset($user['employeeNo']) || empty($user['employeeNo'])) {
                 return null;
             }
 
             $employeeId = trim((string) $user['employeeNo']);
-
-            Log::info("--- Procesando usuario {$index}/{$total}: {$employeeId} ---");
-
-            // Procesar foto
-            $fotoPath = null;
-            if (isset($user['faceURL'])) {
-                $fotoPath = preg_replace('/^https?:\/\//', '', $user['faceURL']);
-                $fotoPath = preg_replace('/^[^\/]+\//', '', $fotoPath);
-                $fotoPath = str_replace('@', '%40', $fotoPath);
-            }
 
             // Determinar departamento
             $grupoId = $user['groupId'] ?? $user['deptID'] ?? null;
@@ -240,7 +197,7 @@ class HikvisionUserService
                 }
             }
 
-            // Fechas de validez
+            // Fechas
             $fechaCreacion = null;
             $fechaModificacion = null;
 
@@ -251,7 +208,7 @@ class HikvisionUserService
                 $fechaModificacion = substr($user['Valid']['endTime'], 0, 10);
             }
 
-            // Estado del usuario
+            // Estado
             $estado = 'Desconocido';
             if (isset($user['Valid']['enable'])) {
                 $estado = $user['Valid']['enable'] ? 'Activo' : 'Inactivo';
@@ -279,13 +236,9 @@ class HikvisionUserService
 
             $nombre = trim($user['name'] ?? $user['userName'] ?? 'Sin nombre');
 
-            Log::info("📋 Datos procesados:", [
-                'employee_no' => $employeeId,
-                'nombre' => $nombre,
-                'departamento' => $departamento,
-                'estado' => $estado
-            ]);
-
+            // IMPORTANTE: Devolver SOLO los datos relevantes
+            // La imagen se devuelve como 'face_image' porque así se llama en la BD
+            // pero el servicio NO debería saber eso, es responsabilidad del comando mapearlo
             return [
                 'employee_no' => $employeeId,
                 'nombre' => $nombre,
@@ -295,12 +248,12 @@ class HikvisionUserService
                 'estado' => $estado,
                 'departamento' => $departamento,
                 'genero' => $genero,
-                'foto_path' => $fotoPath,
-                'device_ip' => $user['device_ip'] ?? null,
+                'face_image' => $user['faceURL'] ?? null, // URL de la imagen tal cual
+                'raw_data' => $user // Opcional: datos originales por si se necesitan
             ];
 
         } catch (Exception $e) {
-            Log::error("Error procesando usuario en índice {$index}: " . $e->getMessage());
+            Log::error("Error normalizando usuario: " . $e->getMessage());
             return null;
         }
     }
@@ -311,16 +264,76 @@ class HikvisionUserService
     public function normalizeUsers(array $rawUsers): array
     {
         $normalized = [];
-        $total = count($rawUsers);
+        $stats = [
+            'total' => count($rawUsers),
+            'con_imagen' => 0,
+            'sin_imagen' => 0,
+            'errores' => 0
+        ];
 
-        foreach ($rawUsers as $index => $user) {
-            $normalizedUser = $this->normalizeUser($user, $index + 1, $total);
+        foreach ($rawUsers as $user) {
+            $normalizedUser = $this->normalizeUser($user);
             
             if ($normalizedUser !== null) {
+                if (!empty($normalizedUser['face_image'])) {
+                    $stats['con_imagen']++;
+                } else {
+                    $stats['sin_imagen']++;
+                }
                 $normalized[] = $normalizedUser;
+            } else {
+                $stats['errores']++;
             }
         }
 
+        Log::info("Normalización completada", $stats);
+
         return $normalized;
+    }
+
+    /**
+     * Procesa un dispositivo y devuelve usuarios normalizados
+     * Este es el método principal para usar con UN SOLO dispositivo
+     */
+    public function processDevice(string $ip, string $deviceName = 'DISPOSITIVO_2'): array
+    {
+        Log::info("Procesando dispositivo: {$deviceName} ({$ip})");
+        
+        // 1. Extraer usuarios del dispositivo
+        $rawUsers = $this->extractDeviceUsers($ip, $deviceName);
+        
+        if (empty($rawUsers)) {
+            Log::warning("No se encontraron usuarios en {$deviceName}");
+            return [];
+        }
+        
+        // 2. Normalizar usuarios
+        $normalizedUsers = $this->normalizeUsers($rawUsers);
+        
+        Log::info("Procesamiento completado para {$deviceName}: " . count($normalizedUsers) . " usuarios normalizados");
+        
+        return $normalizedUsers;
+    }
+
+    /**
+     * @deprecated Usar processDevice para un solo dispositivo
+     */
+    public function processAllDevices(array $devices): array
+    {
+        Log::warning("processAllDevices está deprecado. Use processDevice para un solo dispositivo.");
+        
+        $allUsers = [];
+
+        foreach ($devices as $device) {
+            try {
+                $users = $this->extractDeviceUsers($device['ip'], $device['name']);
+                $allUsers = array_merge($allUsers, $users);
+            } catch (Exception $e) {
+                Log::error("Error en {$device['name']}: " . $e->getMessage());
+                continue;
+            }
+        }
+
+        return $allUsers;
     }
 }

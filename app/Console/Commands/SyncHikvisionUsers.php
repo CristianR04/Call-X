@@ -12,21 +12,10 @@ use Exception;
 
 class SyncHikvisionUsers extends Command
 {
-    /**
-     * The name and signature of the console command.
-     *
-     * @var string
-     */
     protected $signature = 'hikvision:sync-users
-                            {--force : Sobrescribir todos los registros existentes}
-                            {--device= : Sincronizar solo un dispositivo específico (device1 o device2)}';
+                            {--force : Sobrescribir todos los registros existentes}';
 
-    /**
-     * The console command description.
-     *
-     * @var string
-     */
-    protected $description = 'Sincroniza usuarios desde dispositivos Hikvision';
+    protected $description = 'Sincroniza usuarios desde DISPOSITIVO_2';
 
     private HikvisionUserService $userService;
 
@@ -36,153 +25,80 @@ class SyncHikvisionUsers extends Command
         $this->userService = $userService;
     }
 
-    /**
-     * Execute the console command.
-     */
     public function handle()
     {
         $startTime = microtime(true);
 
         $this->info('═══════════════════════════════════════════════════════════');
         $this->info('   SINCRONIZACIÓN DE USUARIOS HIKVISION');
+        $this->info('   Fuente: DISPOSITIVO_2');
         $this->info('═══════════════════════════════════════════════════════════');
         $this->newLine();
 
         $force = $this->option('force');
-        $deviceFilter = $this->option('device');
+        $deviceIp = config('hikvision.device2_ip');
 
-        $this->info("🔄 Modo: " . ($force ? 'FORZADO (sobrescribir)' : 'INCREMENTAL'));
-        
-        if ($deviceFilter) {
-            $this->info("🎯 Dispositivo específico: {$deviceFilter}");
-        }
-        
-        $this->newLine();
-
-        // Obtener dispositivos desde config
-        $devices = [
-            [
-                'name' => 'DISPOSITIVO_1',
-                'ip' => config('hikvision.device1_ip'),
-                'key' => 'device1'
-            ],
-            [
-                'name' => 'DISPOSITIVO_2',
-                'ip' => config('hikvision.device2_ip'),
-                'key' => 'device2'
-            ]
-        ];
-
-        // Filtrar dispositivos configurados
-        $devices = array_filter($devices, function($d) use ($deviceFilter) {
-            if (empty($d['ip'])) {
-                return false;
-            }
-            if ($deviceFilter && $d['key'] !== $deviceFilter) {
-                return false;
-            }
-            return true;
-        });
-
-        if (empty($devices)) {
-            $this->error('❌ No hay dispositivos configurados en .env');
+        if (empty($deviceIp)) {
+            $this->error('❌ DISPOSITIVO_2 no está configurado en .env');
+            $this->line('   Verifique que HIKVISION_DEVICE2_IP esté definida');
             return Command::FAILURE;
         }
 
-        $this->info('🎯 Dispositivos a sincronizar: ' . count($devices));
-        foreach ($devices as $device) {
-            $this->line("   • {$device['name']} ({$device['ip']})");
-        }
+        $this->info("📡 Dispositivo: {$deviceIp}");
+        $this->info("🔄 Modo: " . ($force ? 'FORZADO' : 'INCREMENTAL'));
         $this->newLine();
 
-        // Confirmar antes de continuar
-        if (!$this->confirm('¿Desea continuar con la sincronización?', true)) {
+        if (!$this->confirm('¿Desea continuar?', true)) {
             $this->warn('Operación cancelada');
             return Command::SUCCESS;
         }
 
-        $this->newLine();
-
-        // Crear log de sincronización
         $syncLog = UserSyncLog::create([
-            'total_devices' => count($devices),
+            'total_devices' => 1,
             'status' => 'pending',
             'trigger' => 'manual'
         ]);
 
         try {
-            // Paso 1: Extraer usuarios de dispositivos
-            $this->info('🔄 PASO 1: Extrayendo usuarios de dispositivos...');
-            $rawUsers = $this->userService->processAllDevices($devices);
-
-            $this->info("✅ Usuarios extraídos (con posibles duplicados): " . count($rawUsers));
-            $this->newLine();
-
-            if (empty($rawUsers)) {
-                $this->warn('⚠️  No se encontraron usuarios en los dispositivos');
-                $syncLog->update([
-                    'status' => 'completed',
-                    'duration_ms' => (int)((microtime(true) - $startTime) * 1000)
-                ]);
+            // 1. Obtener usuarios del dispositivo (el servicio hace todo)
+            $this->info('🔄 Obteniendo usuarios del dispositivo...');
+            $users = $this->userService->processDevice($deviceIp, 'DISPOSITIVO_2');
+            
+            if (empty($users)) {
+                $this->warn('⚠️ No se encontraron usuarios');
+                $syncLog->update(['status' => 'completed']);
                 return Command::SUCCESS;
             }
 
-            // Paso 2: Normalizar usuarios
-            $this->info('🔄 PASO 2: Normalizando datos de usuarios...');
-            $normalizedUsers = $this->userService->normalizeUsers($rawUsers);
-            $this->info("✅ Usuarios normalizados: " . count($normalizedUsers));
+            $this->info("✅ Usuarios obtenidos: " . count($users));
             $this->newLine();
 
-            // Paso 2.5: DEDUPLICAR por employee_no (dar prioridad al primero encontrado)
-            $this->info('🔄 PASO 2.5: Eliminando duplicados...');
-            $uniqueUsers = [];
-            $employeeNos = [];
-            $duplicatesCount = 0;
-
-            foreach ($normalizedUsers as $userData) {
-                $employeeNo = $userData['employee_no'];
-                
-                if (!in_array($employeeNo, $employeeNos)) {
-                    $employeeNos[] = $employeeNo;
-                    $uniqueUsers[] = $userData;
-                } else {
-                    $duplicatesCount++;
-                }
-            }
-
-            $this->info("✅ Usuarios únicos: " . count($uniqueUsers));
-            if ($duplicatesCount > 0) {
-                $this->warn("⚠️  Duplicados eliminados: {$duplicatesCount}");
-            }
-            $this->newLine();
-
-            // Paso 3: Guardar en base de datos
-            $this->info('🔄 PASO 3: Guardando en base de datos...');
+            // 2. Guardar en base de datos
+            $this->info('🔄 Guardando en base de datos...');
+            
             $created = 0;
             $updated = 0;
-            $skipped = 0;
             $errors = 0;
 
-            $progressBar = $this->output->createProgressBar(count($uniqueUsers));
+            $progressBar = $this->output->createProgressBar(count($users));
             $progressBar->start();
 
             DB::beginTransaction();
 
             try {
-                foreach ($uniqueUsers as $userData) {
+                foreach ($users as $userData) {
                     $progressBar->advance();
 
                     try {
                         $exists = HikvisionUser::where('employee_no', $userData['employee_no'])->exists();
 
                         if ($exists && !$force) {
-                            $skipped++;
-                            continue;
+                            continue; // Saltar en modo incremental
                         }
 
                         $user = HikvisionUser::updateOrCreate(
                             ['employee_no' => $userData['employee_no']],
-                            $userData
+                            $userData // El servicio ya devuelve los datos en el formato correcto
                         );
 
                         if ($user->wasRecentlyCreated) {
@@ -193,7 +109,7 @@ class SyncHikvisionUsers extends Command
 
                     } catch (Exception $e) {
                         $errors++;
-                        Log::error("Error guardando usuario {$userData['employee_no']}: " . $e->getMessage());
+                        Log::error("Error con usuario {$userData['employee_no']}: " . $e->getMessage());
                     }
                 }
 
@@ -202,40 +118,28 @@ class SyncHikvisionUsers extends Command
                 $progressBar->finish();
                 $this->newLine(2);
 
-                // Actualizar log
                 $syncLog->update([
-                    'successful_devices' => count($devices),
-                    'total_users' => count($uniqueUsers),
+                    'successful_devices' => 1,
+                    'total_users' => count($users),
                     'new_users' => $created,
                     'updated_users' => $updated,
                     'duration_ms' => (int)((microtime(true) - $startTime) * 1000),
                     'status' => 'completed'
                 ]);
 
-                // Resumen
                 $this->info('═══════════════════════════════════════════════════════════');
-                $this->info('   RESUMEN DE SINCRONIZACIÓN');
+                $this->info('   RESUMEN');
                 $this->info('═══════════════════════════════════════════════════════════');
-                $this->line("✅ Nuevos usuarios: {$created}");
-                $this->line("🔄 Usuarios actualizados: {$updated}");
+                $this->line("✅ Nuevos: {$created}");
+                $this->line("🔄 Actualizados: {$updated}");
                 
-                if ($skipped > 0) {
-                    $this->line("⏭️  Usuarios omitidos: {$skipped}");
-                    $this->comment("   (Use --force para sobrescribir usuarios existentes)");
-                }
-
-                if ($duplicatesCount > 0) {
-                    $this->line("🔀 Duplicados entre dispositivos: {$duplicatesCount}");
-                }
-
                 if ($errors > 0) {
-                    $this->warn("⚠️  Errores: {$errors}");
+                    $this->warn("⚠️ Errores: {$errors}");
                 }
                 
                 $this->newLine();
-                $this->info('✨ Sincronización completada exitosamente');
-                $this->info('═══════════════════════════════════════════════════════════');
-
+                $this->info('✨ Sincronización completada');
+                
                 return Command::SUCCESS;
 
             } catch (Exception $e) {
@@ -245,19 +149,13 @@ class SyncHikvisionUsers extends Command
 
         } catch (Exception $e) {
             $this->newLine();
-            $this->error('❌ Error durante la sincronización:');
-            $this->error($e->getMessage());
-            $this->newLine();
-
+            $this->error('❌ Error: ' . $e->getMessage());
+            
             $syncLog->update([
                 'status' => 'error',
                 'error_message' => substr($e->getMessage(), 0, 500),
                 'duration_ms' => (int)((microtime(true) - $startTime) * 1000)
             ]);
-            
-            if ($this->output->isVerbose()) {
-                $this->error($e->getTraceAsString());
-            }
 
             return Command::FAILURE;
         }
